@@ -271,6 +271,8 @@
         let isListening = false;
         let retryCount = 0;
         const MAX_RETRIES = 3;
+        const RECONNECT_DELAY = 1000;
+        const MIN_SPEECH_GAP = 1500;
 
         // تهيئة التطبيق
         document.addEventListener('DOMContentLoaded', () => {
@@ -294,7 +296,6 @@
 
         // حل متعدد المتصفحات للوصول للميكروفون
         async function checkMicrophoneWithFallback() {
-            // المحاولة بالطريقة الحديثة أولاً
             if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
                 return await navigator.mediaDevices.getUserMedia({ 
                     audio: {
@@ -305,7 +306,6 @@
                 });
             }
             
-            // المحاولة بالطرق القديمة إذا فشلت
             const legacyGetUserMedia = navigator.getUserMedia || 
                                      navigator.webkitGetUserMedia || 
                                      navigator.mozGetUserMedia;
@@ -356,7 +356,6 @@
             showProgress('⏳ جاري التحضير...');
             
             try {
-                // إعادة تهيئة التعرف على الصوت في كل مرة
                 if (recognition) {
                     recognition.stop();
                     recognition = null;
@@ -367,19 +366,22 @@
                 
                 initSpeechRecognition();
                 
-                // إضافة تأخير لضمان تهيئة النظام
                 setTimeout(() => {
                     try {
                         recognition.start();
                         showProgress('🎙️ ابدأ القراءة الآن...');
                     } catch (e) {
-                        showMicStatus('❌ فشل التشغيل، جاري إعادة المحاولة...', 'error-mic');
+                        console.error('Error starting recognition:', e);
                         if (retryCount < MAX_RETRIES) {
                             retryCount++;
-                            setTimeout(() => handleStart(), 1500);
+                            showProgress(`🔊 جاري إعادة المحاولة (${retryCount}/${MAX_RETRIES})...`);
+                            setTimeout(() => handleStart(), RECONNECT_DELAY);
+                        } else {
+                            showMicStatus('❌ فشل التشغيل بعد عدة محاولات', 'error-mic');
+                            resetRecognition();
                         }
                     }
-                }, 300);
+                }, 500);
             } catch (error) {
                 console.error('Init error:', error);
                 showMicStatus('❌ خطأ في النظام الصوتي', 'error-mic');
@@ -414,11 +416,10 @@
             
             recognition = new SpeechRecognition();
             
-            // تحسينات للتعرف على العربية
-            recognition.lang = navigator.language.startsWith('ar') ? 'ar-SA' : 'ar-EG';
+            recognition.lang = 'ar-SA';
             recognition.continuous = true;
             recognition.interimResults = false;
-            recognition.maxAlternatives = 3;
+            recognition.maxAlternatives = 5;
             
             recognition.onstart = () => {
                 isListening = true;
@@ -428,28 +429,44 @@
             };
             
             recognition.onresult = (event) => {
-                const transcript = event.results[event.results.length-1][0].transcript;
-                showProgress('🔍 جاري تحليل التلاوة...');
-                setTimeout(() => checkRecitation(transcript), 500);
+                const result = event.results[event.results.length-1];
+                if (result.isFinal) {
+                    const transcript = result[0].transcript;
+                    showProgress('🔍 جاري تحليل التلاوة...');
+                    setTimeout(() => checkRecitation(transcript), 300);
+                }
             };
             
             recognition.onerror = (event) => {
-                let errorMessage = `❌ خطأ: ${getErrorDescription(event.error)}`;
-                if(event.error === 'not-allowed') {
-                    errorMessage = 'تم رفض الإذن. يرجى:\n1. تفعيل الميكروفون في إعدادات المتصفح\n2. التأكد من عدم منع الموقع';
+                console.error('Recognition error:', event.error);
+                
+                if (event.error === 'no-speech') {
+                    showMicStatus('🎤 لم يتم الكشف عن صوت، جاري الاستماع مجدداً...', 'active-mic');
+                    setTimeout(() => {
+                        try {
+                            if (isListening) recognition.start();
+                        } catch(e) {
+                            console.error('Restart error:', e);
+                        }
+                    }, MIN_SPEECH_GAP);
+                    return;
                 }
-                showMicStatus(errorMessage, 'error-mic');
+                
+                let errorMessage = getErrorDescription(event.error);
+                showMicStatus(`❌ ${errorMessage}`, 'error-mic');
                 
                 if (isListening && retryCount < MAX_RETRIES) {
                     retryCount++;
+                    showProgress(`🔄 جاري إعادة المحاولة (${retryCount}/${MAX_RETRIES})...`);
                     setTimeout(() => {
                         try {
                             recognition.start();
                         } catch(e) {
                             console.error('Retry error:', e);
                         }
-                    }, 1000);
+                    }, RECONNECT_DELAY);
                 } else {
+                    showProgress('❌ توقف التسميع بسبب كثرة الأخطاء');
                     resetRecognition();
                 }
             };
@@ -463,7 +480,7 @@
                             console.error('Restart error:', e);
                             resetRecognition();
                         }
-                    }, 800);
+                    }, MIN_SPEECH_GAP);
                 }
             };
         }
@@ -522,13 +539,21 @@
                 .trim();
         }
 
+        function normalizeArabic(text) {
+            return text
+                .replace(/[إأٱآ]/g, 'ا')
+                .replace(/[ة]/g, 'ه')
+                .replace(/[ى]/g, 'ي')
+                .replace(/[ؤئ]/g, 'ء')
+                .normalize('NFKD')
+                .replace(/[\u064B-\u065F\u0670]/g, '');
+        }
+
         function areWordsSimilar(w1, w2) {
             if (w1 === w2) return true;
             
-            // إزالة التشكيل للمقارنة
-            const removeTashkeel = str => str.replace(/[\u064B-\u065F\u0670]/g, '');
-            const cleanW1 = removeTashkeel(w1);
-            const cleanW2 = removeTashkeel(w2);
+            const cleanW1 = normalizeArabic(w1);
+            const cleanW2 = normalizeArabic(w2);
             
             return cleanW1 === cleanW2;
         }
@@ -578,13 +603,16 @@
             const originalText = cleanText(selectedSurah.text);
             const userText = cleanText(transcript);
             
+            const normalizedOriginal = normalizeArabic(originalText);
+            const normalizedUser = normalizeArabic(userText);
+            
             const {
                 resultHTML,
                 correctWords,
                 incorrectWords,
                 missingWords,
                 extraWords
-            } = compareRecitation(originalText, userText);
+            } = compareRecitation(normalizedOriginal, normalizedUser);
             
             const accuracy = calculateAccuracy(correctWords, originalText.split(' ').length);
             
@@ -597,7 +625,13 @@
                 accuracy
             );
             
-            showProgress(accuracy >= 80 ? '🎉 ممتاز! واصل' : accuracy >= 50 ? 'جيد، يمكنك تحسين النتيجة' : 'حاول مرة أخرى للتحسين');
+            let feedback = '';
+            if (accuracy >= 90) feedback = '🎉 ممتاز! تلاوة رائعة';
+            else if (accuracy >= 70) feedback = '👏 جيد جداً، يمكنك تحسين النتيجة قليلاً';
+            else if (accuracy >= 50) feedback = '✓ ليس سيئاً، لكن يحتاج تحسين';
+            else feedback = 'حاول مرة أخرى مع التركيز على النطق';
+            
+            showProgress(feedback);
         }
 
         function displayResults(html, c, i, m, e, a) {
